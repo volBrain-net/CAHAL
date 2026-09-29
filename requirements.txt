@@ -1,0 +1,9 @@
+monai==1.3.0
+nilearn==0.13.0
+torch>=2.4
+numpy
+nibabel
+scipy
+tensorboard
+pandas
+tqdm
