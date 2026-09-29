@@ -24,7 +24,7 @@ pip install nibabel numpy antspyx torch torchio
 
 ## Files & Folders
 - cahal.py — main pipeline script.
-- models_*_half/ — trained model files.
+- models_*_half/ — trained model files. To download the models go to https://zenodo.org/records/23032648 and download T1w and FLAIR pth files. 
 
 
 ## Usage
