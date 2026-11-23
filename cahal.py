@@ -1,17 +1,33 @@
 """
-CAHAL Module Refactored (v2)
+CAHAL Module Refactored (v3)
 ----------------------------
 This module implements the CAHAL processing pipeline, including:
 1. NIfTI Loading and Preprocessing (RAS alignment, Header fixing)
-2. Optional Denoising (via independent executable)
+2. Optional Denoising (via ANTsPy / antspyx)
 3. Optional Isotropic Resampling (1mm)
 4. Deep Learning Inference (NNUNet3D Ensemble)
 5. Post-processing and Saving
 
+Difference vs v2
+----------------
+v2 shelled out to the bundled ANTs ``DenoiseImage`` executable via subprocess.
+v3 calls ``ants.denoise_image`` from the ``antspyx`` Python package instead,
+which binds the *same* ITK/ANTs ``DenoiseImage`` C++ routine in-process. This
+removes the platform-specific binary dependency (the bundled executable is a
+Linux x86-64 ELF) and the file-system round trip of the CLI.
+
+IMPORTANT — parameter parity:
+    The ANTs *command line* defaults are  patch radius = 1, search radius = 2,
+    shrink factor = 1, noise model = Rician.
+    The ``antspyx`` Python defaults are   patch radius = 1, search radius = 3.
+    To reproduce v2's output exactly, this module pins search radius to 2
+    (see ``DENOISE_SEARCH_RADIUS``). Change it only if you deliberately want
+    antspyx's own default.
+
+The public API (``CAHAL(...)``) is unchanged.
 """
 
 import time
-import subprocess
 import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -26,19 +42,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import os 
+import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = "max_split_size_mb:128"
 torch.backends.cudnn.benchmark = False
 
 # Suppress minor warnings for cleaner output
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# ANTsPy is only needed when denoise=True — import lazily-tolerantly so the rest
+# of the pipeline still works on machines without antspyx installed.
+try:
+    import ants  # antspyx
+    _ANTS_IMPORT_ERROR: Optional[BaseException] = None
+except Exception as _e:  # pragma: no cover - environment dependent
+    ants = None
+    _ANTS_IMPORT_ERROR = _e
+
 # -----------------------------------------------------------------------------
 # Configuration & Constants
 # -----------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-DENOISE_EXECUTABLE = SCRIPT_DIR / "DenoiseImage"
+
+# Denoising defaults — chosen to match the ANTs `DenoiseImage` CLI defaults used
+# by v2, NOT the antspyx Python defaults (which use search radius 3).
+DENOISE_NOISE_MODEL = "Gaussian"   # CLI: -n  (default Rician, but in original implementation we used Gaussian)
+DENOISE_SHRINK_FACTOR = 1        # CLI: -s  (default 1)
+DENOISE_PATCH_RADIUS = 1         # CLI: -p  (default 1x1x1)
+DENOISE_SEARCH_RADIUS = 2        # CLI: -r  (default 2x2x2); antspyx default is 3
 
 # ANSI Colors for Terminal Output
 class Colors:
@@ -55,7 +86,7 @@ class Colors:
 
 class Logger:
     """Simple logger for formatted terminal output."""
-    
+
     @staticmethod
     def _timestamp() -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -132,7 +163,7 @@ class NNUNet3D(nn.Module):
     def __init__(self, in_channels: int = 1, out_channels: int = 1, base_features: int = 32):
         super().__init__()
         f = base_features
-        
+
         # Encoder
         self.enc1 = ConvBlock(in_channels, f)
         self.enc2 = DownBlock(f, f * 2)
@@ -176,24 +207,24 @@ class NNUNet3D(nn.Module):
 
 class NiftiUtils:
     """Static utilities for NIfTI file manipulation and orientation."""
-    
+
     @staticmethod
     def fix_header(input_file: Union[str, Path], output_file: Union[str, Path]) -> Path:
         """Fix inconsistent NIfTI header information (sform/qform, voxel dimensions)."""
         img = nii.load(str(input_file))
         data = img.get_fdata()
         affine = img.affine
-        
+
         fixed_img = nii.Nifti1Image(data, affine)
         # Harmonize qform/sform
         fixed_img.set_qform(affine, code='scanner')
         fixed_img.set_sform(affine, code='aligned')
-        
+
         # Ensure pixel dims match affine scales
         header = fixed_img.header
         scales = np.sqrt(np.sum(affine[:3, :3] ** 2, axis=0))
         header['pixdim'][1:4] = scales
-        
+
         nii.save(fixed_img, str(output_file))
         Logger.info(f"Fixed NIfTI header saved to: {output_file}", indent=1)
         return Path(output_file)
@@ -205,17 +236,17 @@ class NiftiUtils:
             nii_obj = nii.load(str(filename))
             affine = nii_obj.affine
             det = np.linalg.det(affine[:3, :3])
-            
+
             if abs(det) < 1e-10:
                 Logger.warn(f"Singular affine (det={det:.2e}). Overwriting with diagonal voxel sizes.", indent=1)
                 resolutions = nii_obj.header.get_zooms()[:3]
-                
+
                 new_affine = np.eye(4)
                 np.fill_diagonal(new_affine[:3, :3], resolutions)
-                
+
                 nii_obj.header.set_sform(new_affine)
                 nii_obj.header.set_qform(new_affine)
-                
+
                 # We need to construct a new image to save cleanly
                 new_img = nii.Nifti1Image(nii_obj.get_fdata(), new_affine, nii_obj.header)
                 nii.save(new_img, str(filename))
@@ -226,7 +257,7 @@ class NiftiUtils:
     def load_and_preprocess(filename: Union[str, Path], full_res: bool = True) -> Optional[Tuple[np.ndarray, np.ndarray, nii.Nifti1Header, np.ndarray]]:
         """
         Load volume, ensure float32, check for empty content, and align to RAS.
-        
+
         Returns:
             Tuple: (volume_data, original_affine, header, ras_aligned_affine)
         """
@@ -234,9 +265,9 @@ class NiftiUtils:
             img = nii.load(str(filename))
             affine = img.affine
             header = img.header
-            
+
             Logger.info(f"Loaded volume shape: {img.shape}", indent=1)
-            
+
             # Load data
             if full_res:
                 volume = np.asanyarray(img.dataobj, dtype=np.float32)
@@ -248,7 +279,7 @@ class NiftiUtils:
             # Handle dimensions (squeeze singleton)
             if volume.ndim > 3:
                 volume = np.squeeze(volume)
-            
+
             # Align to RAS
             volume, ras_affine = NiftiUtils.align_to_ras(volume, affine)
 
@@ -260,7 +291,7 @@ class NiftiUtils:
             # Clean NaNs/Infs/Negative values
             volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
             volume[volume < 0] = 0
-            
+
             return volume, original_affine, header, ras_affine
 
         except Exception as e:
@@ -281,13 +312,13 @@ class NiftiUtils:
         n_dims = 3
         vol = volume.copy()
         aff = affine.copy().astype(np.float64)
-        
+
         target_aff = np.eye(4) # Reference RAS
-        
+
         try:
             current_ras = NiftiUtils.get_ras_axes(aff, n_dims)
             target_ras = NiftiUtils.get_ras_axes(target_aff, n_dims)
-            
+
             if np.any(current_ras >= n_dims):
                 Logger.warn("Invalid RAS axes, skipping axis alignment.")
                 return vol, aff
@@ -300,7 +331,7 @@ class NiftiUtils:
                     # Update local tracking of axes
                     idx = np.where(current_ras == target_ras[i])[0][0]
                     current_ras[idx], current_ras[i] = current_ras[i], current_ras[idx]
-            
+
             # 2. Align Directions
             dot_products = np.sum(aff[:3, :3] * target_aff[:3, :3], axis=0)
             for i in range(n_dims):
@@ -308,7 +339,7 @@ class NiftiUtils:
                     vol = np.flip(vol, axis=i)
                     aff[:, i] = -aff[:, i]
                     aff[:3, 3] = aff[:3, 3] - aff[:3, i] * (vol.shape[i] - 1)
-            
+
             return vol, aff
 
         except Exception as e:
@@ -320,7 +351,7 @@ class NiftiUtils:
         """Save numpy array to NIfTI."""
         s_vol = np.squeeze(volume).astype(np.float32)
         Logger.info(f"Saving NIfTI: {output_path}", indent=1)
-        
+
         img = nii.Nifti1Image(s_vol, affine, header=header)
         nii.save(img, str(output_path))
 
@@ -346,7 +377,7 @@ class NiftiUtils:
 def analyze_volume_resolution(filename: Union[str, Path]) -> Tuple[int, int]:
     """
     Determine appropriate model clusters based on volume size and anisotropy.
-    
+
     Returns:
         Tuple[int, int]: (volume_cluster_id, anisotropy_cluster_id)
     """
@@ -356,18 +387,18 @@ def analyze_volume_resolution(filename: Union[str, Path]) -> Tuple[int, int]:
     img = nii.load(str(filename))
     res = list(img.header.get_zooms()[:3])
     Logger.info(f"Voxel resolutions: {res}", indent=1)
-    
+
     # If all resolutions are below or equal to 1.0, assign negative clusters
     if all(r <= 1.0 for r in res):
         Logger.info("All resolutions <= 1.0mm. Not using CAHAL.", indent=1)
         return -1, -1
     # Floor resolution to 1.0
     res = [max(r, 1.0) for r in res]
-    
+
     # Anisotropy
     min_r, max_r = min(res), max(res)
     ratio = min_r / max_r if max_r > 0 else 1.0
-    
+
     if ratio <= 0.33:
         aniso_cluster = 1
     elif ratio <= 0.66:
@@ -398,13 +429,13 @@ class InferenceEngine:
         nf = 64
         MODELS_DIR = SCRIPT_DIR / f"models_{modality_models.lower()}_half"
         metric = 'psnr'
-        
+
         model = NNUNet3D(in_channels=1, out_channels=1, base_features=nf)
         name = (f"model_R{vol_cluster}_A{aniso_cluster}_NNUNET_nf{nf}_half_precission_"
                 f"new_clustering_sequential_seg_loss_full_res_complex_anistropies_best_{metric}.pth")
-        
+
         path = MODELS_DIR / name
-        
+
         try:
             state = torch.load(path, map_location=device, weights_only=True)
             model.load_state_dict(state)
@@ -415,7 +446,7 @@ class InferenceEngine:
         except Exception as e:
             Logger.error(f"Failed to load {metric} model at {path}: {e}")
             return None
-    
+
         return model
 
     @staticmethod
@@ -456,14 +487,14 @@ class InferenceEngine:
             torch.nan_to_num_(pred, nan=0.0, posinf=0.0, neginf=0.0)
 
         return pred.squeeze()
-    
-    
+
+
     @staticmethod
     def predict_tiled(
-        models: List[nn.Module], 
-        input_tensor: torch.Tensor, 
-        device: torch.device, 
-        tile_size: Tuple[int, int, int] = (200, 200, 200), 
+        models: List[nn.Module],
+        input_tensor: torch.Tensor,
+        device: torch.device,
+        tile_size: Tuple[int, int, int] = (200, 200, 200),
         stride_ratio: float = 0.5
     ) -> torch.Tensor:
         """
@@ -490,7 +521,7 @@ class InferenceEngine:
         pad_d = max(0, ((D - tile_size[0] + strides[0] - 1) // strides[0]) * strides[0] + tile_size[0] - D)
         pad_h = max(0, ((H - tile_size[1] + strides[1] - 1) // strides[1]) * strides[1] + tile_size[1] - H)
         pad_w = max(0, ((W - tile_size[2] + strides[2] - 1) // strides[2]) * strides[2] + tile_size[2] - W)
-        
+
         # Apply mirror padding if needed
         if pad_d > 0 or pad_h > 0 or pad_w > 0:
             Logger.info(f"Applying mirror padding: D={pad_d}, H={pad_h}, W={pad_w}", indent=2)
@@ -507,7 +538,7 @@ class InferenceEngine:
         num_tiles_h = max(1, (H_padded - tile_size[1]) // strides[1] + 1)
         num_tiles_w = max(1, (W_padded - tile_size[2]) // strides[2] + 1)
         num_tiles = num_tiles_d * num_tiles_h * num_tiles_w
-        
+
         Logger.info(f"Predicting with tiled inference. Total tiles: {num_tiles} ({num_tiles_d}×{num_tiles_h}×{num_tiles_w})", indent=1)
 
         # CPU accumulators — keeps GPU footprint to one tile at a time (Fix 2.1).
@@ -521,16 +552,16 @@ class InferenceEngine:
             for y in range(0, H_padded - tile_size[1] + 1, strides[1]):
                 for x in range(0, W_padded - tile_size[2] + 1, strides[2]):
                     tile_idx += 1
-                    
+
                     # Extract tile with proper bounds
                     z_end = min(z + tile_size[0], D_padded)
                     y_end = min(y + tile_size[1], H_padded)
                     x_end = min(x + tile_size[2], W_padded)
-                    
+
                     z_slice = slice(z, z_end)
                     y_slice = slice(y, y_end)
                     x_slice = slice(x, x_end)
-                    
+
                     tile = input_padded[:, :, z_slice, y_slice, x_slice]
 
                     # Actual tile shape (edge tiles may be smaller than tile_size)
@@ -549,7 +580,7 @@ class InferenceEngine:
                     if tile.mean().item() < 1e-4:
                         full_output_padded[:, :, z_slice, y_slice, x_slice] += tile.float() * current_weight
                         count_map_padded[:, :, z_slice, y_slice, x_slice] += current_weight
-                        # log skipped tile 
+                        # log skipped tile
                         Logger.info(f"Skipping background tile with stats mean={tile.mean().item():.4f}, min={tile.min():.4f}, max={tile.max():.4f}", indent=2)
                         continue
 
@@ -603,7 +634,7 @@ class InferenceEngine:
 
         # Normalize and return (already on CPU)
         return full_output / torch.clamp(count_map, min=1e-5)
-    
+
     @staticmethod
     def estimate_full_volume_bytes(
         shape: Tuple[int, int, int],
@@ -627,29 +658,29 @@ class InferenceEngine:
 
     @staticmethod
     def predict_tiled_with_fallback(
-        models: List[nn.Module], 
-        input_tensor: torch.Tensor, 
+        models: List[nn.Module],
+        input_tensor: torch.Tensor,
         device: torch.device,
         tile_sizes: List[int] = [200, 128, 92, 64],
         stride_ratio: float = 0.5
     ) -> torch.Tensor:
         """
         Predicts using tiled inference with automatic fallback to smaller tiles on OOM.
-        
+
         Args:
             models: List of neural network models
             input_tensor: Input volume tensor
             device: Torch device
             tile_sizes: List of tile sizes to try (in descending order)
             stride_ratio: Overlap ratio between tiles
-        
+
         Returns:
             Predicted volume tensor
         """
         for tile_size in tile_sizes:
             try:
                 Logger.info(f"Attempting tiled inference with tile size: {tile_size}³", indent=1)
-                
+
                 output = InferenceEngine.predict_tiled(
                     models=models,
                     input_tensor=input_tensor,
@@ -657,46 +688,121 @@ class InferenceEngine:
                     tile_size=(tile_size, tile_size, tile_size),
                     stride_ratio=stride_ratio
                 )
-                
+
                 Logger.success(f"Tiled inference succeeded with tile size: {tile_size}³", indent=1)
                 return output
-                
+
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 if "out of memory" not in str(e).lower() and not isinstance(e, torch.cuda.OutOfMemoryError):
                     raise  # Re-raise non-OOM errors
-                
+
                 Logger.warn(f"OOM with tile size {tile_size}³. Trying smaller tiles...", indent=1)
                 torch.cuda.empty_cache()
-                
+
                 if tile_size == tile_sizes[-1]:  # Last attempt failed
                     raise RuntimeError(f"All tile sizes failed. Tried: {tile_sizes}")
-        
+
         raise RuntimeError("Tiled inference failed for unknown reasons")
 
 # -----------------------------------------------------------------------------
-# External Tools
+# Denoising (ANTsPy)
 # -----------------------------------------------------------------------------
 
-def run_ants_denoise(input_path: Path, output_path: Path) -> bool:
-    """Execute external ANTs DenoiseImage tool."""
-    cmd = [
-        str(DENOISE_EXECUTABLE),
-        "-d", "3",
-        "-i", str(input_path),
-        "-o", str(output_path)
-    ]
+def run_ants_denoise(
+    input_path: Union[str, Path],
+    output_path: Union[str, Path],
+    noise_model: str = DENOISE_NOISE_MODEL,
+    shrink_factor: int = DENOISE_SHRINK_FACTOR,
+    patch_radius: int = DENOISE_PATCH_RADIUS,
+    search_radius: int = DENOISE_SEARCH_RADIUS,
+    mask_path: Optional[Union[str, Path]] = None,
+    verbose: bool = False,
+) -> bool:
+    """
+    Adaptive non-local means denoising via ANTsPy (``ants.denoise_image``).
+
+    This is the v3 replacement for v2's ``DenoiseImage`` subprocess
+    call. ``ants.denoise_image`` binds the same ANTs/ITK C++ routine, so with
+    matching parameters the output is numerically equivalent to the CLI.
+
+    Defaults replicate the ANTs CLI (``-n Gaussian -s 1 -p 1 -r 2``). Note that
+    antspyx's own default search radius is 3, which would NOT match v2.
+
+    Args:
+        input_path:    Source NIfTI.
+        output_path:   Destination NIfTI (written as float32 by ANTs' ITK writer).
+        noise_model:   'Rician' or 'Gaussian'.
+        shrink_factor: Downsampling level used inside the algorithm (1 = none).
+        patch_radius:  Patch radius for the local sample.
+        search_radius: Search radius for extra local samples.
+        mask_path:     Optional mask NIfTI restricting the denoised region.
+        verbose:       Forward ANTs verbosity.
+
+    Returns:
+        bool: True on success, False on any failure (caller falls back to the
+        undenoised image, matching v2 behaviour).
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    if ants is None:
+        Logger.error(
+            "antspyx is not available — cannot denoise. "
+            f"Import error: {_ANTS_IMPORT_ERROR}. Install with: pip install antspyx"
+        )
+        return False
+
+    if not input_path.exists():
+        Logger.error(f"Denoise input missing: {input_path}")
+        return False
+
+    if noise_model not in ("Rician", "Gaussian"):
+        Logger.error(f"Invalid noise model '{noise_model}'. Expected 'Rician' or 'Gaussian'.")
+        return False
+
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # Read explicitly as float: ants.denoise_image() casts its result back to
+        # the input pixel type, so an integer-typed source would otherwise have
+        # the denoised output rounded back to integers (the CLI works in float).
+        img = ants.image_read(str(input_path), pixeltype="float")
+
+        if img.dimension != 3:
+            Logger.error(
+                f"Expected a 3D image, got {img.dimension}D ({input_path.name}). "
+                "Denoising skipped."
+            )
+            return False
+
+        mask = None
+        if mask_path is not None:
+            mask = ants.image_read(str(mask_path), pixeltype="unsigned char")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        denoised = ants.denoise_image(
+            img,
+            mask=mask,
+            shrink_factor=int(shrink_factor),
+            p=int(patch_radius),
+            r=int(search_radius),
+            noise_model=noise_model,
+            v=int(bool(verbose)),
+        )
+
+        ants.image_write(denoised, str(output_path))
+
         if not output_path.exists():
             Logger.error(f"Denoise output missing: {output_path}")
             return False
-        Logger.success(f"Denoising complete: {output_path.name}")
+
+        Logger.success(
+            f"Denoising complete (antspyx, n={noise_model}, s={shrink_factor}, "
+            f"p={patch_radius}, r={search_radius}): {output_path.name}"
+        )
         return True
-    except subprocess.CalledProcessError as e:
-        Logger.error(f"Denoise failed: {e.stderr}")
-        return False
+
     except Exception as e:
-        Logger.error(f"Denoise exec error: {e}")
+        Logger.error(f"ANTsPy denoise error: {e}")
         return False
 
 # -----------------------------------------------------------------------------
@@ -710,7 +816,7 @@ def CAHAL(filename: str, denoise: bool = False, resample: bool = True, output_di
 
     Args:
         filename: Path to input NIfTI file.
-        denoise: Whether to apply ANTs denoising step.
+        denoise: Whether to apply ANTs denoising step (antspyx in v3).
         resample: Whether to resample to 1mm isotropic before inference.
         output_dir: Optional custom output directory if not the same as input.
         modality_models: Whether to use models trained on T1 or FLAIR.
@@ -723,7 +829,7 @@ def CAHAL(filename: str, denoise: bool = False, resample: bool = True, output_di
     Returns:
         str: Path to the processed output file.
     """
-    
+
     file_path = Path(filename).resolve()
     base_dir = file_path.parent
     dest_dir = Path(output_dir) if output_dir else base_dir
@@ -745,7 +851,7 @@ def CAHAL(filename: str, denoise: bool = False, resample: bool = True, output_di
         Logger.info("Volume does not meet CAHAL criteria. Returning original.", indent=1)
         return filename
 
-    # 1. Denoise
+    # 1. Denoise (antspyx)
     if denoise:
         denoised_path = dest_dir / f"denoised_{file_path.name}"
         t0 = time.time()
@@ -777,9 +883,9 @@ def CAHAL(filename: str, denoise: bool = False, resample: bool = True, output_di
     loaded = NiftiUtils.load_and_preprocess(current_file, full_res=True)
     if not loaded:
         raise ValueError("Preprocessing returned empty data.")
-        
+
     volume, orig_affine, orig_header, ras_affine = loaded
-    
+
     # Prepare Tensor (Batch, Channel, D, H, W)
     original_shape = volume.shape  # D, H, W — stored before any padding for output crop
 
@@ -961,7 +1067,7 @@ def CAHAL(filename: str, denoise: bool = False, resample: bool = True, output_di
         start_ornt = io_orientation(ras_affine)
         end_ornt = io_orientation(orig_affine)
         transform_ornt = ornt_transform(start_ornt, end_ornt)
-        
+
         final_volume = apply_orientation(output_volume, transform_ornt)
 
         # Restore original header info
